@@ -1,0 +1,9 @@
+# Scanner Bridge dependencies (Windows only)
+# Install with:  pip install -r requirements_bridge.txt
+
+requests>=2.28.0      # HTTP POST to workshop API
+pystray>=0.19.0       # optional system-tray icon
+Pillow>=9.0.0         # required by pystray for icon rendering
+
+# pywin32 is optional – all Win32 calls use ctypes directly
+# pywin32>=306
