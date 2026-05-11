@@ -1,0 +1,7 @@
+{
+  "sales_scanner_device_id": null,
+  "workshop_scanner_device_id": null,
+  "api_url": "http://127.0.0.1:5000/api/workshop-usage/scan",
+  "debounce_ms": 700,
+  "sales_prefix": ""
+}
