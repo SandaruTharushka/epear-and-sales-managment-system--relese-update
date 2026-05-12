@@ -34,10 +34,22 @@ from typing import Callable, Dict, List, Optional, Tuple
 IS_WINDOWS = sys.platform == "win32"
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Frozen-path support (PyInstaller)
+# ──────────────────────────────────────────────────────────────────────────────
+# When packaged, sys._MEIPASS points to the unpacked bundle.
+# Writable files (logs, config) must live beside the .exe, not in _MEIPASS.
+_IS_FROZEN = getattr(sys, "frozen", False)
+if _IS_FROZEN:
+    # Writable root = directory that contains the .exe
+    _WRITABLE_ROOT = Path(sys.executable).parent
+else:
+    _WRITABLE_ROOT = Path(__file__).parent
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Logging
 # ──────────────────────────────────────────────────────────────────────────────
-_LOG_DIR = Path("logs")
-_LOG_DIR.mkdir(exist_ok=True)
+_LOG_DIR = _WRITABLE_ROOT / "logs"
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,11 +60,12 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("scanner_bridge")
+log.info("Scanner bridge initialising (frozen=%s, root=%s)", _IS_FROZEN, _WRITABLE_ROOT)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ──────────────────────────────────────────────────────────────────────────────
-_CFG_DIR  = Path("config")
+_CFG_DIR  = _WRITABLE_ROOT / "config"
 _CFG_PATH = _CFG_DIR / "scanner_devices.json"
 
 _DEFAULT_CFG: dict = {
@@ -1077,14 +1090,28 @@ def launch_bridge_subprocess() -> Optional[object]:
     Launch scanner_bridge.py as a detached subprocess.
     Returns the Popen handle, or None if launch fails.
     The main app MUST NOT crash if this returns None.
+
+    Handles both normal (script) and frozen (PyInstaller) execution.
     """
     import subprocess
     try:
-        script = Path(__file__).resolve()
+        if _IS_FROZEN:
+            # Frozen: look for a sidecar scanner_bridge.exe, else re-run main exe
+            sidecar = Path(sys.executable).parent / "scanner_bridge.exe"
+            if sidecar.exists():
+                cmd = [str(sidecar)]
+            else:
+                # Re-invoke the same frozen EXE – it must handle a --bridge flag
+                cmd = [sys.executable, "--bridge"]
+        else:
+            script = Path(__file__).resolve()
+            cmd = [sys.executable, str(script)]
+
         proc = subprocess.Popen(
-            [sys.executable, str(script)],
-            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-            if IS_WINDOWS else 0,
+            cmd,
+            creationflags=(
+                subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            ) if IS_WINDOWS else 0,
             close_fds=True,
         )
         log.info("Scanner bridge subprocess launched (pid=%d)", proc.pid)

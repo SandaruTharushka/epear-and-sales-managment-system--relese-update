@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Scanner Settings – Garage POS</title>
+  <style>
+    :root {
+      --primary: #2563eb;
+      --primary-hover: #1d4ed8;
+      --success: #16a34a;
+      --danger:  #dc2626;
+      --warn:    #d97706;
+      --border:  #e5e7eb;
+      --bg:      #f9fafb;
+      --card:    #ffffff;
+      --text:    #111827;
+      --muted:   #6b7280;
+      --radius:  8px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 24px;
+    }
+    h1 { font-size: 1.5rem; margin-bottom: 4px; }
+    .subtitle { color: var(--muted); font-size: 0.875rem; margin-bottom: 24px; }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px 24px;
+      margin-bottom: 20px;
+    }
+    .card h2 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin-bottom: 16px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    /* Status row */
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .status-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: var(--muted);
+      flex-shrink: 0;
+    }
+    .status-dot.ok      { background: var(--success); }
+    .status-dot.warn    { background: var(--warn); }
+    .status-dot.error   { background: var(--danger); }
+
+    /* Form grid */
+    .form-grid {
+      display: grid;
+      grid-template-columns: 200px 1fr;
+      gap: 10px 16px;
+      align-items: center;
+    }
+    label { font-size: 0.875rem; color: var(--muted); }
+    select, input[type="text"], input[type="number"] {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 0.9rem;
+      outline: none;
+    }
+    select:focus, input:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(37,99,235,0.15);
+    }
+
+    /* Buttons */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-size: 0.875rem;
+      font-weight: 500;
+      cursor: pointer;
+      border: none;
+      transition: background 0.15s;
+    }
+    .btn-primary { background: var(--primary); color: #fff; }
+    .btn-primary:hover { background: var(--primary-hover); }
+    .btn-secondary {
+      background: #fff;
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+    .btn-secondary:hover { background: var(--bg); }
+    .btn-danger { background: var(--danger); color: #fff; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .btn-row { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
+
+    /* Last scan display */
+    .scan-display {
+      background: #f3f4f6;
+      border-radius: 6px;
+      padding: 10px 14px;
+      font-family: monospace;
+      font-size: 1rem;
+      min-height: 42px;
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .scan-display.flash {
+      animation: flash 0.4s ease;
+    }
+    @keyframes flash {
+      0%   { background: #bfdbfe; }
+      100% { background: #f3f4f6; }
+    }
+
+    /* Device list */
+    .device-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .device-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 14px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: #fafafa;
+      font-size: 0.85rem;
+    }
+    .device-item .badge {
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .badge-sales     { background: #dbeafe; color: #1d4ed8; }
+    .badge-workshop  { background: #d1fae5; color: #065f46; }
+    .badge-unassigned{ background: #f3f4f6; color: var(--muted); }
+    .device-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .device-id   { font-family: monospace; font-size: 0.75rem; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 300px; }
+
+    /* Toast notification */
+    #toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      padding: 12px 20px;
+      border-radius: 8px;
+      font-size: 0.875rem;
+      font-weight: 500;
+      color: #fff;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s;
+      z-index: 9999;
+    }
+    #toast.show { opacity: 1; }
+    #toast.ok   { background: var(--success); }
+    #toast.err  { background: var(--danger); }
+    #toast.warn { background: var(--warn); }
+
+    .divider { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
+  </style>
+</head>
+<body>
+
+<h1>Scanner Settings</h1>
+<p class="subtitle">Configure barcode scanners – sales billing vs. workshop stock deduction</p>
+
+<!-- ═══════════════════════════════════════════════════════
+     Bridge Status
+══════════════════════════════════════════════════════════ -->
+<div class="card">
+  <h2>Bridge Status</h2>
+  <div class="status-row">
+    <div class="status-dot" id="dot-bridge"></div>
+    <span id="lbl-bridge">Checking…</span>
+  </div>
+  <div class="status-row">
+    <div class="status-dot" id="dot-sales"></div>
+    <span id="lbl-sales">Sales scanner: checking…</span>
+  </div>
+  <div class="status-row">
+    <div class="status-dot" id="dot-workshop"></div>
+    <span id="lbl-workshop">Workshop scanner: checking…</span>
+  </div>
+  <div class="btn-row">
+    <button class="btn btn-secondary" onclick="refreshStatus()">Refresh Status</button>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     Device Assignment
+══════════════════════════════════════════════════════════ -->
+<div class="card">
+  <h2>Device Assignment</h2>
+
+  <div class="form-grid">
+    <label for="sel-sales">Sales / Billing scanner</label>
+    <select id="sel-sales">
+      <option value="">— Not assigned —</option>
+    </select>
+
+    <label for="sel-workshop">Workshop scanner</label>
+    <select id="sel-workshop">
+      <option value="">— Not assigned —</option>
+    </select>
+  </div>
+
+  <hr class="divider" />
+
+  <h2 style="border:none;padding:0;margin-bottom:12px;">API &amp; Timing</h2>
+  <div class="form-grid">
+    <label for="inp-api">Workshop API URL</label>
+    <input type="text" id="inp-api" placeholder="http://127.0.0.1:5000/api/workshop-usage/scan" />
+
+    <label for="inp-debounce">Duplicate protection (ms)</label>
+    <input type="number" id="inp-debounce" min="100" max="5000" step="50" value="700" style="width:120px" />
+  </div>
+
+  <div class="btn-row">
+    <button class="btn btn-secondary" onclick="detectDevices()">Detect Scanners</button>
+    <button class="btn btn-primary"   onclick="saveConfig()">Save Settings</button>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     Detected Devices
+══════════════════════════════════════════════════════════ -->
+<div class="card">
+  <h2>Detected HID Keyboard Devices</h2>
+  <ul class="device-list" id="device-list">
+    <li class="device-item" id="no-devices-msg">
+      <span class="device-name">Click "Detect Scanners" to list connected devices</span>
+    </li>
+  </ul>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     Test Scanner
+══════════════════════════════════════════════════════════ -->
+<div class="card">
+  <h2>Test Scanner</h2>
+  <p style="font-size:0.875rem;color:var(--muted);margin-bottom:12px;">
+    Scan a barcode with each scanner to verify it is captured correctly.<br>
+    The <strong>Sales scanner</strong> result will appear in the billing/search bar.<br>
+    The <strong>Workshop scanner</strong> result will appear below.
+  </p>
+
+  <label style="font-size:0.875rem;color:var(--muted);display:block;margin-bottom:6px;">
+    Last workshop scan received:
+  </label>
+  <div class="scan-display" id="last-scan">—</div>
+
+  <div class="btn-row">
+    <button class="btn btn-secondary" onclick="sendTestScan()">Send Test Scan (API)</button>
+    <button class="btn btn-secondary" onclick="clearLastScan()">Clear</button>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script src="js/scanner_settings.js"></script>
+</body>
+</html>
