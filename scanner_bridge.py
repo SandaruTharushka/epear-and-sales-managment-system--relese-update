@@ -65,7 +65,7 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("scanner_bridge")
-log.info("Scanner bridge initialising (frozen=%s, root=%s)", _IS_FROZEN, _WRITABLE_ROOT)
+log.info("Scanner Bridge starting... (frozen=%s, root=%s)", _IS_FROZEN, _WRITABLE_ROOT)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -487,11 +487,11 @@ class WorkshopHandler:
         now  = time.monotonic()
         last = self._last.get(barcode, 0.0)
         if now - last < self._debounce:
-            log.debug("Workshop duplicate suppressed: %r", barcode)
+            log.debug("Workshop scan duplicate suppressed: %r (debounce %.0fms)", barcode, self._debounce * 1000)
             return
         self._last[barcode] = now
 
-        log.info("Workshop scan: %r", barcode)
+        log.info("Workshop scan received: %r → queuing API POST to %s", barcode, self.api_url)
         threading.Thread(
             target=self._post, args=(barcode,), daemon=True, name="WorkshopPost"
         ).start()
@@ -504,15 +504,17 @@ class WorkshopHandler:
                 "quantity": 1,
                 "source":   "raw_input_workshop_scanner",
             }
+            log.info("API POST → %s  payload=%r", self.api_url, payload)
             resp = _req.post(self.api_url, json=payload, timeout=5)
             resp.raise_for_status()
-            log.info("Workshop POST OK %d ← %r", resp.status_code, barcode)
+            log.info("API POST success: HTTP %d ← barcode %r", resp.status_code, barcode)
             if self._status_cb:
                 self._status_cb("last_workshop_scan", barcode)
                 self._status_cb("last_error", "")
         except Exception as exc:
-            msg = f"POST failed for {barcode!r}: {exc}"
-            log.error(msg)
+            import traceback
+            msg = f"API POST failed for {barcode!r}: {exc}"
+            log.error("%s\n%s", msg, traceback.format_exc())
             if self._status_cb:
                 self._status_cb("last_error", msg)
 
@@ -614,85 +616,110 @@ class RawInputBridge:
         return None
 
     def _message_loop(self) -> None:
-        self._refresh_handle_map()
+        try:
+            log.info("RawInputBridge: device enumeration starting")
+            self._refresh_handle_map()
+            log.info("RawInputBridge: %d keyboard device(s) enumerated", len(self._handle_map))
 
-        # ── register window class ────────────────────────────────────────────
-        wndproc      = _WNDPROCTYPE(self._wnd_proc)
-        self._wndproc_ref = wndproc          # prevent GC
+            # ── register window class ────────────────────────────────────────────
+            wndproc      = _WNDPROCTYPE(self._wnd_proc)
+            self._wndproc_ref = wndproc          # prevent GC
 
-        wc = WNDCLASSEXW()
-        wc.cbSize       = ctypes.sizeof(WNDCLASSEXW)
-        wc.lpfnWndProc  = ctypes.cast(wndproc, ctypes.c_void_p)
-        wc.hInstance    = _kernel32.GetModuleHandleW(None)
-        wc.lpszClassName = self._WND_CLASS
+            wc = WNDCLASSEXW()
+            wc.cbSize       = ctypes.sizeof(WNDCLASSEXW)
+            wc.lpfnWndProc  = ctypes.cast(wndproc, ctypes.c_void_p)
+            wc.hInstance    = _kernel32.GetModuleHandleW(None)
+            wc.lpszClassName = self._WND_CLASS
 
-        atom = _user32.RegisterClassExW(ctypes.byref(wc))
-        if not atom:
-            err = ctypes.GetLastError()
-            if err != 1410:             # ERROR_CLASS_ALREADY_EXISTS – acceptable
-                log.error("RegisterClassExW failed: %d", err)
-                return
+            atom = _user32.RegisterClassExW(ctypes.byref(wc))
+            if not atom:
+                err = ctypes.GetLastError()
+                if err != 1410:             # ERROR_CLASS_ALREADY_EXISTS – acceptable
+                    msg = f"RegisterClassExW failed (error {err})"
+                    log.error("RawInputBridge: %s", msg)
+                    if self._status_cb:
+                        self._status_cb("bridge_status", f"Error: {msg}")
+                    return
 
-        # ── create hidden message-only window ────────────────────────────────
-        hwnd = _user32.CreateWindowExW(
-            0, self._WND_CLASS, "Scanner Bridge",
-            0, 0, 0, 0, 0,
-            -3,     # HWND_MESSAGE
-            None, _kernel32.GetModuleHandleW(None), None,
-        )
-        if not hwnd:
-            log.error("CreateWindowExW failed: %d", ctypes.GetLastError())
-            return
-        self._hwnd = hwnd
-
-        # ── register Raw Input (all keyboards, background capture) ───────────
-        rid = RAWINPUTDEVICE()
-        rid.usUsagePage = HID_USAGE_PAGE_GENERIC
-        rid.usUsage     = HID_USAGE_GENERIC_KEYBOARD
-        rid.dwFlags     = RIDEV_INPUTSINK
-        rid.hwndTarget  = hwnd
-        if not _user32.RegisterRawInputDevices(
-            ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE)
-        ):
-            log.error("RegisterRawInputDevices failed: %d", ctypes.GetLastError())
-
-        # ── install low-level keyboard hook (for workshop suppression) ───────
-        hookproc = _HOOKPROCTYPE(self._keyboard_hook)
-        self._hookproc_ref = hookproc
-
-        self._hook = _user32.SetWindowsHookExW(
-            WH_KEYBOARD_LL, hookproc, None, 0
-        )
-        if not self._hook:
-            log.warning(
-                "SetWindowsHookExW failed (%d) – workshop keystroke suppression disabled",
-                ctypes.GetLastError(),
+            # ── create hidden message-only window ────────────────────────────────
+            hwnd = _user32.CreateWindowExW(
+                0, self._WND_CLASS, "Scanner Bridge",
+                0, 0, 0, 0, 0,
+                -3,     # HWND_MESSAGE
+                None, _kernel32.GetModuleHandleW(None), None,
             )
+            if not hwnd:
+                err = ctypes.GetLastError()
+                msg = f"CreateWindowExW failed (error {err})"
+                log.error("RawInputBridge: %s", msg)
+                if self._status_cb:
+                    self._status_cb("bridge_status", f"Error: {msg}")
+                return
+            self._hwnd = hwnd
+            log.info("RawInputBridge: hidden message window created (hwnd=%d)", hwnd)
 
-        log.info("RawInputBridge running (hwnd=%d)", hwnd)
-        if self._status_cb:
-            self._status_cb("bridge_status", "Running")
+            # ── register Raw Input (all keyboards, background capture) ───────────
+            rid = RAWINPUTDEVICE()
+            rid.usUsagePage = HID_USAGE_PAGE_GENERIC
+            rid.usUsage     = HID_USAGE_GENERIC_KEYBOARD
+            rid.dwFlags     = RIDEV_INPUTSINK
+            rid.hwndTarget  = hwnd
+            if not _user32.RegisterRawInputDevices(
+                ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE)
+            ):
+                err = ctypes.GetLastError()
+                msg = f"RegisterRawInputDevices failed (error {err})"
+                log.error("RawInputBridge: %s", msg)
+                if self._status_cb:
+                    self._status_cb("bridge_status", f"Error: {msg}")
+                return
+            log.info("RawInputBridge: raw input registration successful (RIDEV_INPUTSINK)")
 
-        # ── message pump ────────────────────────────────────────────────────
-        msg = MSG()
-        while self._running:
-            r = _user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-            if r == 0 or r == -1:
-                break
-            _user32.TranslateMessage(ctypes.byref(msg))
-            _user32.DispatchMessageW(ctypes.byref(msg))
+            # ── install low-level keyboard hook (for workshop suppression) ───────
+            hookproc = _HOOKPROCTYPE(self._keyboard_hook)
+            self._hookproc_ref = hookproc
 
-        # ── cleanup ──────────────────────────────────────────────────────────
-        if self._hook:
-            _user32.UnhookWindowsHookEx(self._hook)
-            self._hook = None
-        if self._hwnd:
-            _user32.DestroyWindow(self._hwnd)
-            self._hwnd = None
+            self._hook = _user32.SetWindowsHookExW(
+                WH_KEYBOARD_LL, hookproc, None, 0
+            )
+            if not self._hook:
+                log.warning(
+                    "RawInputBridge: SetWindowsHookExW failed (%d) – workshop keystroke suppression disabled",
+                    ctypes.GetLastError(),
+                )
+            else:
+                log.info("RawInputBridge: low-level keyboard hook installed")
 
-        log.info("RawInputBridge stopped")
-        if self._status_cb:
-            self._status_cb("bridge_status", "Stopped")
+            log.info("RawInputBridge: listener running (hwnd=%d)", hwnd)
+            if self._status_cb:
+                self._status_cb("bridge_status", "Listening")
+
+            # ── message pump ────────────────────────────────────────────────────
+            msg = MSG()
+            while self._running:
+                r = _user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if r == 0 or r == -1:
+                    break
+                _user32.TranslateMessage(ctypes.byref(msg))
+                _user32.DispatchMessageW(ctypes.byref(msg))
+
+            # ── cleanup ──────────────────────────────────────────────────────────
+            if self._hook:
+                _user32.UnhookWindowsHookEx(self._hook)
+                self._hook = None
+            if self._hwnd:
+                _user32.DestroyWindow(self._hwnd)
+                self._hwnd = None
+
+            log.info("RawInputBridge: stopped")
+            if self._status_cb:
+                self._status_cb("bridge_status", "Stopped")
+
+        except Exception as exc:
+            import traceback
+            log.error("RawInputBridge: fatal exception in message loop:\n%s", traceback.format_exc())
+            if self._status_cb:
+                self._status_cb("bridge_status", f"Error: {exc}")
 
     # ── WndProc ───────────────────────────────────────────────────────────────
 
@@ -933,7 +960,7 @@ class StatusWindow:
         self._bridge = bridge
         self._cfg    = cfg
         self._vals: Dict[str, str] = {
-            "bridge_status":     "Starting…",
+            "bridge_status":     "Starting...",
             "sales_scanner":     "Configured" if cfg.get("sales_scanner_device_id") else "Not configured",
             "workshop_scanner":  "Configured" if cfg.get("workshop_scanner_device_id") else "Not configured",
             "last_workshop_scan": "—",
@@ -1011,7 +1038,12 @@ class StatusWindow:
             if key == "last_error":
                 lbl.config(foreground="red" if val else "black")
             elif key == "bridge_status":
-                lbl.config(foreground="green" if val == "Running" else "orange")
+                if val == "Listening":
+                    lbl.config(foreground="green")
+                elif val.startswith("Error") or val == "No scanners detected":
+                    lbl.config(foreground="red")
+                else:
+                    lbl.config(foreground="orange")
 
     def _open_setup(self) -> None:
         SetupDialog(self.root, self._cfg, on_save=self._on_config_saved)
@@ -1147,6 +1179,26 @@ def _acquire_single_instance() -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# API connectivity check (runs in background thread)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _check_api_connectivity(api_url: str) -> None:
+    """Fire-and-forget: log whether the workshop API server is reachable."""
+    def _check() -> None:
+        try:
+            import requests as _req
+            from urllib.parse import urlparse
+            parsed = urlparse(api_url)
+            base   = f"{parsed.scheme}://{parsed.netloc}/"
+            resp   = _req.get(base, timeout=3)
+            log.info("API connectivity check: %s → HTTP %d", base, resp.status_code)
+        except Exception as exc:
+            log.warning("API connectivity check failed (%s): %s", api_url, exc)
+
+    threading.Thread(target=_check, daemon=True, name="ApiConnCheck").start()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # CLI entry point
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -1159,12 +1211,11 @@ def main() -> None:
         print("Scanner bridge is already running.")
         sys.exit(0)
 
-    cfg = load_config()
+    log.info("Scanner Bridge starting...")
 
-    # First-run: open setup dialog immediately if no devices are mapped
-    first_run = not (cfg.get("sales_scanner_device_id") or cfg.get("workshop_scanner_device_id"))
-
-    # Status routing – the bridge and window share this callback
+    # Status routing – the bridge and window share this callback.
+    # status_win_holder is populated BEFORE bridge.start() to avoid a race
+    # where the bridge thread fires status_cb before the window is registered.
     status_win_holder: List[Optional[StatusWindow]] = [None]
 
     def status_cb(key: str, value: str) -> None:
@@ -1172,28 +1223,75 @@ def main() -> None:
         if sw:
             sw.status_cb(key, value)
 
-    bridge = RawInputBridge(cfg, status_cb=status_cb)
-    bridge.start()
+    try:
+        cfg = load_config()
+        log.info("Config loaded: api_url=%s  debounce_ms=%s",
+                 cfg.get("api_url"), cfg.get("debounce_ms"))
 
-    sw = StatusWindow(bridge, cfg)
-    status_win_holder[0] = sw
+        # Enumerate devices and log results
+        log.info("Enumerating keyboard HID devices...")
+        devices = enumerate_keyboards()
+        if devices:
+            log.info("Found %d keyboard device(s):", len(devices))
+            for d in devices:
+                log.info("  [%s] keys=%s  id=%s",
+                         d["friendly_name"], d["keys_total"], d["device_id"])
+        else:
+            log.warning("No keyboard HID devices detected")
 
-    if first_run:
-        # Defer the setup dialog until the main window is ready
-        sw.root = tk.Tk()   # we build it early so after() works
-        sw.root.withdraw()
-        sw.root.after(200, lambda: (sw.root.deiconify(), sw._build_ui(), sw._refresh(), sw._open_setup()))
-        sw.root.title("Scanner Bridge")
-        sw.root.resizable(False, False)
-        sw.root.protocol("WM_DELETE_WINDOW", sw._quit)
-        sw.root.attributes("-topmost", True)
-        sw.root.after(1500, lambda: sw.root.attributes("-topmost", False))
-        sw.root.mainloop()
-    else:
-        sw.run()
+        # First-run: open setup dialog if no devices are mapped
+        first_run = not (cfg.get("sales_scanner_device_id") or cfg.get("workshop_scanner_device_id"))
 
-    bridge.stop()
-    bridge.wait()
+        bridge = RawInputBridge(cfg, status_cb=status_cb)
+        sw = StatusWindow(bridge, cfg)
+
+        # Register the window BEFORE starting the bridge to avoid the race
+        # condition where status_cb fires with "Listening" before status_win_holder
+        # is populated (which would leave the UI stuck on "Starting...").
+        status_win_holder[0] = sw
+
+        # API reachability check (background, non-blocking)
+        _check_api_connectivity(cfg.get("api_url", _DEFAULT_CFG["api_url"]))
+
+        log.info("Starting raw input listener thread...")
+        bridge.start()
+        log.info("Raw input listener thread started")
+
+        if not devices:
+            status_cb("bridge_status", "No scanners detected")
+
+        if first_run:
+            # Defer the setup dialog until the main window is ready
+            sw.root = tk.Tk()
+            sw.root.withdraw()
+            sw.root.after(200, lambda: (sw.root.deiconify(), sw._build_ui(), sw._refresh(), sw._open_setup()))
+            sw.root.title("Scanner Bridge")
+            sw.root.resizable(False, False)
+            sw.root.protocol("WM_DELETE_WINDOW", sw._quit)
+            sw.root.attributes("-topmost", True)
+            sw.root.after(1500, lambda: sw.root.attributes("-topmost", False))
+            sw.root.mainloop()
+        else:
+            sw.run()
+
+        bridge.stop()
+        bridge.wait()
+        log.info("Scanner Bridge exited cleanly")
+
+    except Exception:
+        import traceback
+        tb = traceback.format_exc()
+        log.error("Fatal error during scanner bridge startup:\n%s", tb)
+        status_cb("bridge_status", "Error: see scanner_bridge.log")
+        try:
+            from tkinter import messagebox as _mb
+            _mb.showerror(
+                "Scanner Bridge Error",
+                f"A fatal error occurred at startup.\n\nSee logs/scanner_bridge.log for details.\n\n{tb}",
+            )
+        except Exception:
+            pass
+        sys.exit(1)
 
 
 if __name__ == "__main__":
