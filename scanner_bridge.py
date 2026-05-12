@@ -394,6 +394,27 @@ if IS_WINDOWS:
     _user32.CallNextHookEx.argtypes = [
         wintypes.HANDLE, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM,
     ]
+
+    # ToUnicodeEx: converts VK + scan code to Unicode characters using the
+    # active keyboard layout — more reliable than any static VK→char table.
+    _user32.ToUnicodeEx.restype  = ctypes.c_int
+    _user32.ToUnicodeEx.argtypes = [
+        wintypes.UINT,                   # wVirtKey
+        wintypes.UINT,                   # wScanCode
+        ctypes.POINTER(ctypes.c_ubyte),  # lpKeyState (256 bytes)
+        wintypes.LPWSTR,                 # pwszBuff
+        ctypes.c_int,                    # cchBuff
+        wintypes.UINT,                   # wFlags
+        ctypes.c_void_p,                 # dwhkl  (HKL – opaque handle)
+    ]
+
+    _user32.GetKeyboardLayout.restype  = ctypes.c_void_p
+    _user32.GetKeyboardLayout.argtypes = [wintypes.DWORD]
+
+    _user32.PeekMessageW.restype  = wintypes.BOOL
+    _user32.PeekMessageW.argtypes = [
+        ctypes.POINTER(MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT,
+    ]
 else:
     _WNDPROCTYPE  = None
     _HOOKPROCTYPE = None
@@ -426,6 +447,38 @@ _VK_MAP: Dict[int, Tuple[str, str]] = {
 def _vkey_to_char(vkey: int, shifted: bool) -> Optional[str]:
     entry = _VK_MAP.get(vkey)
     return (entry[1] if shifted else entry[0]) if entry else None
+
+
+def _scancode_to_char(vkey: int, scan_code: int, shift_down: bool) -> Optional[str]:
+    """
+    Convert a VK code + hardware scan code to the actual typed character by
+    calling ToUnicodeEx with the current keyboard layout.  This is correct for
+    any layout and avoids hard-coded VK→char tables entirely.
+
+    Returns the printable character string, or None if the key produces no
+    printable output (modifiers, function keys, dead keys, etc.).
+    """
+    if not IS_WINDOWS:
+        return None
+
+    kb_state = (ctypes.c_ubyte * 256)()
+    if shift_down:
+        kb_state[VK_SHIFT]  = 0x80
+        kb_state[VK_LSHIFT] = 0x80
+
+    buf    = ctypes.create_unicode_buffer(8)
+    layout = _user32.GetKeyboardLayout(0)   # layout of the calling thread (foreground)
+    n      = _user32.ToUnicodeEx(vkey, scan_code, kb_state, buf, 8, 0, layout)
+
+    if n > 0:
+        ch = buf.value[:n]
+        return ch if ch.isprintable() else None
+
+    if n == -1:
+        # Dead-key state was set; flush it so future calls are not affected.
+        _user32.ToUnicodeEx(VK_ESCAPE, 0x01, kb_state, buf, 8, 0, layout)
+
+    return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -510,15 +563,23 @@ class ScannerBuffer:
         self._chars:  Dict[int, List[str]] = defaultdict(list)
         self._shifted: Dict[int, bool]     = defaultdict(bool)
 
-    def key_down(self, handle: int, vkey: int) -> Optional[str]:
+    def key_down(self, handle: int, vkey: int, scan_code: int = 0) -> Optional[str]:
+        log.debug(
+            "RAW_KEY_EVENT device=0x%X vkey=0x%02X scan=0x%02X shift=%s",
+            handle, vkey, scan_code, self._shifted[handle],
+        )
+
         if vkey in (VK_SHIFT, VK_LSHIFT, VK_RSHIFT):
             self._shifted[handle] = True
             return None
 
         if vkey == VK_RETURN:
+            # Enter terminates the scan; it must not contribute a character.
             barcode = "".join(self._chars[handle])
             self._chars[handle]   = []
             self._shifted[handle] = False
+            if barcode:
+                log.info("FINAL_BARCODE device=0x%X barcode=%r len=%d", handle, barcode, len(barcode))
             return barcode or None
 
         if vkey == VK_BACK:
@@ -531,9 +592,17 @@ class ScannerBuffer:
             self._shifted[handle] = False
             return None
 
-        ch = _vkey_to_char(vkey, self._shifted[handle])
+        # Prefer ToUnicodeEx (layout-aware); fall back to the static VK map.
+        ch = _scancode_to_char(vkey, scan_code, self._shifted[handle])
+        if ch is None:
+            ch = _vkey_to_char(vkey, self._shifted[handle])
+
         if ch:
             self._chars[handle].append(ch)
+            log.debug(
+                "APPENDED_CHAR device=0x%X vkey=0x%02X scan=0x%02X char=%r buffer=%r",
+                handle, vkey, scan_code, ch, "".join(self._chars[handle]),
+            )
         return None
 
     def key_up(self, handle: int, vkey: int) -> None:
@@ -568,6 +637,8 @@ class WorkshopHandler:
         if not barcode:
             return
 
+        log.info("FINAL_BARCODE accepted: %r  len=%d", barcode, len(barcode))
+
         now  = time.monotonic()
         last = self._last.get(barcode, 0.0)
         if now - last < self._debounce:
@@ -588,7 +659,7 @@ class WorkshopHandler:
                 "quantity": 1,
                 "source":   "raw_input_workshop_scanner",
             }
-            log.info("API POST → %s  payload=%r", self.api_url, payload)
+            log.info("API_SENT_BARCODE %r → POST %s  payload=%r", barcode, self.api_url, payload)
             resp = _req.post(self.api_url, json=payload, timeout=5)
             resp.raise_for_status()
             log.info("API POST success: HTTP %d ← barcode %r", resp.status_code, barcode)
@@ -640,9 +711,25 @@ class RawInputBridge:
             status_cb=status_cb,
         )
 
-        # Keys pending suppression: vkey → expiry (monotonic)
-        self._suppress:      Dict[int, float] = {}
-        self._suppress_lock  = threading.Lock()
+        # Suppress workshop-scanner keystrokes from reaching the focused POS window.
+        #
+        # Two complementary mechanisms are combined so that the hook reliably
+        # suppresses every digit regardless of whether WM_INPUT or the LL hook
+        # fires first for a given keystroke:
+        #
+        # 1. _suppress_counts[vkey] — incremented by WM_INPUT for each workshop
+        #    key-down; decremented (and the keystroke suppressed) when the hook
+        #    fires for that vkey.  Handles repeated digits correctly: each digit
+        #    occurrence gets its own counter slot increment rather than a single
+        #    timestamp that would be overwritten.
+        #
+        # 2. _workshop_active_until — set to monotonic() + 300 ms by the first
+        #    WM_INPUT of a scan and refreshed by every subsequent key.  This
+        #    catches any key whose hook fires *before* the matching WM_INPUT is
+        #    dispatched (a known timing race on Windows).
+        self._suppress_counts:       Dict[int, int] = defaultdict(int)
+        self._workshop_active_until: float           = 0.0
+        self._suppress_lock          = threading.Lock()
 
         self._hwnd:     Optional[int] = None
         self._hook:     Optional[int] = None
@@ -936,21 +1023,41 @@ class RawInputBridge:
         handle    = raw.header.hDevice
         flags     = raw.data.keyboard.Flags
         vkey      = raw.data.keyboard.VKey
+        scan_code = raw.data.keyboard.MakeCode
         is_down   = not bool(flags & RI_KEY_BREAK)
 
         role = self._role_for_handle(handle)
+
+        log.debug(
+            "RAW_KEY_EVENT handle=0x%X vkey=0x%02X scan=0x%02X flags=0x%02X "
+            "is_down=%s role=%s",
+            handle, vkey, scan_code, flags, is_down, role or "unmapped",
+        )
+
         if role is None:
             return                              # unmapped device – pass through
 
         if role == "workshop":
             if is_down:
-                barcode = self._buffer.key_down(handle, vkey)
-                if barcode:
-                    self._workshop.handle_scan(barcode)
-                # Mark vkey for suppression in the keyboard hook
+                # Arm / refresh both suppression mechanisms BEFORE buffering so
+                # that the LL hook (which may already be queued) can see them.
                 with self._suppress_lock:
-                    self._suppress[vkey] = time.monotonic() + 0.08   # 80 ms window
+                    self._suppress_counts[vkey] += 1
+                    self._workshop_active_until = time.monotonic() + 0.30  # 300 ms rolling
+
+                barcode = self._buffer.key_down(handle, vkey, scan_code)
+                if barcode:
+                    log.info(
+                        "FINAL_BARCODE device=0x%X barcode=%r len=%d",
+                        handle, barcode, len(barcode),
+                    )
+                    # Scan complete – clear suppression state immediately.
+                    with self._suppress_lock:
+                        self._suppress_counts.clear()
+                        self._workshop_active_until = 0.0
+                    self._workshop.handle_scan(barcode)
             else:
+                # Key-up: release shift tracking only; do not touch suppress state.
                 self._buffer.key_up(handle, vkey)
 
         # sales role: nothing extra to do – keystrokes pass through normally
@@ -961,11 +1068,22 @@ class RawInputBridge:
         if n_code == HC_ACTION and wparam in (WM_KEYDOWN, WM_SYSKEYDOWN):
             kb   = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
             vkey = kb.vkCode
+
             with self._suppress_lock:
-                expiry = self._suppress.get(vkey, 0.0)
-            if expiry and time.monotonic() < expiry:
-                with self._suppress_lock:
-                    self._suppress.pop(vkey, None)
+                count  = self._suppress_counts.get(vkey, 0)
+                active = time.monotonic() < self._workshop_active_until
+
+            if count > 0 or active:
+                # Consume one count slot for this vkey (if available).
+                if count > 0:
+                    with self._suppress_lock:
+                        if self._suppress_counts[vkey] > 0:
+                            self._suppress_counts[vkey] -= 1
+
+                log.debug(
+                    "HOOK_SUPPRESS vkey=0x%02X count=%d active_window=%s",
+                    vkey, count, active,
+                )
                 return 1        # suppress: do NOT call CallNextHookEx
 
         return _user32.CallNextHookEx(self._hook or 0, n_code, wparam, lparam)
