@@ -16,6 +16,11 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wintypes
+
+# Python 3.11 on Windows dropped wintypes.LRESULT; provide a fallback.
+if not hasattr(wintypes, "LRESULT"):
+    wintypes.LRESULT = ctypes.c_ssize_t
+
 import json
 import logging
 import os
