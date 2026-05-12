@@ -137,6 +137,9 @@ WM_KEYDOWN     = 0x0100
 WM_SYSKEYDOWN  = 0x0104
 HC_ACTION      = 0
 
+# HWND_MESSAGE: creates a message-only window (no display, no Z-order)
+HWND_MESSAGE = -3
+
 # ──────────────────────────────────────────────────────────────────────────────
 # ctypes structures
 # ──────────────────────────────────────────────────────────────────────────────
@@ -310,6 +313,87 @@ if IS_WINDOWS:
     )
     _user32   = ctypes.windll.user32
     _kernel32 = ctypes.windll.kernel32
+
+    # ── Win32 function prototypes ─────────────────────────────────────────────
+    # Setting argtypes/restype is critical on 64-bit Windows: without them ctypes
+    # defaults to c_int (32-bit) returns, which truncates HWND / HINSTANCE values
+    # and causes CreateWindowExW error 1400 (ERROR_INVALID_WINDOW_HANDLE).
+
+    _kernel32.GetModuleHandleW.restype  = wintypes.HINSTANCE
+    _kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+
+    _user32.RegisterClassExW.restype  = ctypes.c_ushort   # ATOM = WORD
+    _user32.RegisterClassExW.argtypes = [ctypes.POINTER(WNDCLASSEXW)]
+
+    _user32.UnregisterClassW.restype  = wintypes.BOOL
+    _user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+
+    _user32.CreateWindowExW.restype  = wintypes.HWND
+    _user32.CreateWindowExW.argtypes = [
+        wintypes.DWORD,      # dwExStyle
+        wintypes.LPCWSTR,    # lpClassName
+        wintypes.LPCWSTR,    # lpWindowName
+        wintypes.DWORD,      # dwStyle
+        ctypes.c_int,        # X
+        ctypes.c_int,        # Y
+        ctypes.c_int,        # nWidth
+        ctypes.c_int,        # nHeight
+        wintypes.HWND,       # hWndParent  ← HWND_MESSAGE = -3 passed here
+        wintypes.HANDLE,     # hMenu
+        wintypes.HINSTANCE,  # hInstance
+        ctypes.c_void_p,     # lpParam
+    ]
+
+    _user32.DestroyWindow.restype  = wintypes.BOOL
+    _user32.DestroyWindow.argtypes = [wintypes.HWND]
+
+    _user32.PostMessageW.restype  = wintypes.BOOL
+    _user32.PostMessageW.argtypes = [
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+    ]
+
+    _user32.GetMessageW.restype  = wintypes.BOOL
+    _user32.GetMessageW.argtypes = [
+        ctypes.POINTER(MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT,
+    ]
+
+    _user32.TranslateMessage.restype  = wintypes.BOOL
+    _user32.TranslateMessage.argtypes = [ctypes.POINTER(MSG)]
+
+    _user32.DispatchMessageW.restype  = wintypes.LRESULT
+    _user32.DispatchMessageW.argtypes = [ctypes.POINTER(MSG)]
+
+    _user32.DefWindowProcW.restype  = wintypes.LRESULT
+    _user32.DefWindowProcW.argtypes = [
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+    ]
+
+    _user32.PostQuitMessage.restype  = None
+    _user32.PostQuitMessage.argtypes = [ctypes.c_int]
+
+    _user32.RegisterRawInputDevices.restype  = wintypes.BOOL
+    _user32.RegisterRawInputDevices.argtypes = [
+        ctypes.POINTER(RAWINPUTDEVICE), wintypes.UINT, wintypes.UINT,
+    ]
+
+    _user32.GetRawInputData.restype  = wintypes.UINT
+    _user32.GetRawInputData.argtypes = [
+        wintypes.HANDLE, wintypes.UINT, ctypes.c_void_p,
+        ctypes.POINTER(wintypes.UINT), wintypes.UINT,
+    ]
+
+    _user32.SetWindowsHookExW.restype  = wintypes.HANDLE
+    _user32.SetWindowsHookExW.argtypes = [
+        ctypes.c_int, _HOOKPROCTYPE, wintypes.HINSTANCE, wintypes.DWORD,
+    ]
+
+    _user32.UnhookWindowsHookEx.restype  = wintypes.BOOL
+    _user32.UnhookWindowsHookEx.argtypes = [wintypes.HANDLE]
+
+    _user32.CallNextHookEx.restype  = wintypes.LRESULT
+    _user32.CallNextHookEx.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM,
+    ]
 else:
     _WNDPROCTYPE  = None
     _HOOKPROCTYPE = None
@@ -616,85 +700,170 @@ class RawInputBridge:
         return None
 
     def _message_loop(self) -> None:
+        import traceback as _tb
+
+        def _fail(msg: str, fallback: bool = False) -> None:
+            """Log failure, write to log file, update UI status."""
+            log.error("RawInputBridge: %s", msg)
+            try:
+                with open(str(_LOG_DIR / "scanner_bridge.log"), "a", encoding="utf-8") as _f:
+                    _f.write(f"[WIN32 FAIL] {msg}\n")
+            except Exception:
+                pass
+            if self._status_cb:
+                if fallback:
+                    self._status_cb("bridge_status", "Fallback keyboard mode")
+                else:
+                    self._status_cb("bridge_status", f"Error: {msg}")
+
         try:
-            log.info("RawInputBridge: device enumeration starting")
+            log.info("RawInputBridge: message loop thread started (tid=%d)", threading.get_ident())
+
+            # ── device enumeration ───────────────────────────────────────────────
+            log.info("RawInputBridge: enumerating keyboard HID devices...")
             self._refresh_handle_map()
             log.info("RawInputBridge: %d keyboard device(s) enumerated", len(self._handle_map))
 
-            # ── register window class ────────────────────────────────────────────
-            wndproc      = _WNDPROCTYPE(self._wnd_proc)
-            self._wndproc_ref = wndproc          # prevent GC
+            # ── obtain module instance handle ────────────────────────────────────
+            hinstance = _kernel32.GetModuleHandleW(None)
+            log.info("RawInputBridge: hInstance=0x%X", hinstance or 0)
+            if not hinstance:
+                err = ctypes.GetLastError()
+                _fail(f"GetModuleHandleW returned NULL (error {err})", fallback=True)
+                return
+
+            # ── build window class ───────────────────────────────────────────────
+            wndproc           = _WNDPROCTYPE(self._wnd_proc)
+            self._wndproc_ref = wndproc          # keep callable alive (GC guard)
 
             wc = WNDCLASSEXW()
-            wc.cbSize       = ctypes.sizeof(WNDCLASSEXW)
-            wc.lpfnWndProc  = ctypes.cast(wndproc, ctypes.c_void_p)
-            wc.hInstance    = _kernel32.GetModuleHandleW(None)
+            wc.cbSize        = ctypes.sizeof(WNDCLASSEXW)
+            wc.lpfnWndProc   = ctypes.cast(wndproc, ctypes.c_void_p)
+            wc.hInstance     = hinstance
             wc.lpszClassName = self._WND_CLASS
+            log.info(
+                "RawInputBridge: registering window class %r (cbSize=%d, hInstance=0x%X)",
+                self._WND_CLASS, wc.cbSize, hinstance,
+            )
 
             atom = _user32.RegisterClassExW(ctypes.byref(wc))
+            reg_err = ctypes.GetLastError()
+            log.info("RawInputBridge: RegisterClassExW → atom=%d, GetLastError=%d", atom, reg_err)
+
             if not atom:
-                err = ctypes.GetLastError()
-                if err != 1410:             # ERROR_CLASS_ALREADY_EXISTS – acceptable
-                    msg = f"RegisterClassExW failed (error {err})"
-                    log.error("RawInputBridge: %s", msg)
-                    if self._status_cb:
-                        self._status_cb("bridge_status", f"Error: {msg}")
+                if reg_err == 1410:             # ERROR_CLASS_ALREADY_EXISTS
+                    # Unregister the stale class (left from a previous failed run in
+                    # this same process) and try once more.
+                    log.info(
+                        "RawInputBridge: class already exists – unregistering and re-registering"
+                    )
+                    _user32.UnregisterClassW(self._WND_CLASS, hinstance)
+                    atom = _user32.RegisterClassExW(ctypes.byref(wc))
+                    reg_err = ctypes.GetLastError()
+                    log.info(
+                        "RawInputBridge: re-register → atom=%d, GetLastError=%d", atom, reg_err
+                    )
+
+                if not atom:
+                    _fail(
+                        f"RegisterClassExW failed (error {reg_err})", fallback=True
+                    )
                     return
 
-            # ── create hidden message-only window ────────────────────────────────
-            hwnd = _user32.CreateWindowExW(
-                0, self._WND_CLASS, "Scanner Bridge",
-                0, 0, 0, 0, 0,
-                -3,     # HWND_MESSAGE
-                None, _kernel32.GetModuleHandleW(None), None,
-            )
-            if not hwnd:
-                err = ctypes.GetLastError()
-                msg = f"CreateWindowExW failed (error {err})"
-                log.error("RawInputBridge: %s", msg)
-                if self._status_cb:
-                    self._status_cb("bridge_status", f"Error: {msg}")
-                return
-            self._hwnd = hwnd
-            log.info("RawInputBridge: hidden message window created (hwnd=%d)", hwnd)
+            log.info("RawInputBridge: window class registered (atom=%d)", atom)
 
-            # ── register Raw Input (all keyboards, background capture) ───────────
+            # ── create hidden message-only window ────────────────────────────────
+            # HWND_MESSAGE (-3) instructs Windows to create a message-only window:
+            # no screen position, no Z-order, receives only posted/sent messages.
+            # argtypes on CreateWindowExW ensure -3 is passed as a full-width HWND
+            # (pointer-sized) rather than a 32-bit c_int, avoiding error 1400 on
+            # 64-bit Windows.
+            log.info(
+                "RawInputBridge: calling CreateWindowExW(hWndParent=HWND_MESSAGE=%d, hInstance=0x%X)",
+                HWND_MESSAGE, hinstance,
+            )
+            hwnd = _user32.CreateWindowExW(
+                0,                  # dwExStyle
+                self._WND_CLASS,    # lpClassName
+                "Scanner Bridge",   # lpWindowName
+                0,                  # dwStyle
+                0, 0, 0, 0,         # x, y, w, h
+                HWND_MESSAGE,       # hWndParent  ← typed as HWND via argtypes
+                None,               # hMenu
+                hinstance,          # hInstance   ← full 64-bit value via argtypes
+                None,               # lpParam
+            )
+            create_err = ctypes.GetLastError()
+            log.info(
+                "RawInputBridge: CreateWindowExW → hwnd=0x%X, GetLastError=%d",
+                hwnd or 0, create_err,
+            )
+
+            if not hwnd:
+                _fail(
+                    f"CreateWindowExW failed (error {create_err}) – "
+                    f"hwnd=NULL, hInstance=0x{hinstance:X}, hWndParent={HWND_MESSAGE}",
+                    fallback=True,
+                )
+                return
+
+            self._hwnd = hwnd
+            log.info("RawInputBridge: message-only window created (hwnd=0x%X)", hwnd)
+
+            # ── register Raw Input (all keyboards, RIDEV_INPUTSINK) ──────────────
             rid = RAWINPUTDEVICE()
             rid.usUsagePage = HID_USAGE_PAGE_GENERIC
             rid.usUsage     = HID_USAGE_GENERIC_KEYBOARD
             rid.dwFlags     = RIDEV_INPUTSINK
             rid.hwndTarget  = hwnd
-            if not _user32.RegisterRawInputDevices(
+            log.info(
+                "RawInputBridge: calling RegisterRawInputDevices "
+                "(usUsagePage=0x%X, usUsage=0x%X, dwFlags=0x%X, hwndTarget=0x%X)",
+                rid.usUsagePage, rid.usUsage, rid.dwFlags, hwnd,
+            )
+            ok = _user32.RegisterRawInputDevices(
                 ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE)
-            ):
-                err = ctypes.GetLastError()
-                msg = f"RegisterRawInputDevices failed (error {err})"
-                log.error("RawInputBridge: %s", msg)
-                if self._status_cb:
-                    self._status_cb("bridge_status", f"Error: {msg}")
-                return
-            log.info("RawInputBridge: raw input registration successful (RIDEV_INPUTSINK)")
+            )
+            rid_err = ctypes.GetLastError()
+            log.info(
+                "RawInputBridge: RegisterRawInputDevices → ok=%s, GetLastError=%d",
+                bool(ok), rid_err,
+            )
 
-            # ── install low-level keyboard hook (for workshop suppression) ───────
-            hookproc = _HOOKPROCTYPE(self._keyboard_hook)
+            if not ok:
+                _fail(
+                    f"RegisterRawInputDevices failed (error {rid_err})", fallback=True
+                )
+                # Destroy the window we created; do not leave a dangling handle.
+                _user32.DestroyWindow(self._hwnd)
+                self._hwnd = None
+                return
+
+            log.info("RawInputBridge: WM_INPUT registration successful (RIDEV_INPUTSINK)")
+
+            # ── install WH_KEYBOARD_LL hook (workshop keystroke suppression) ─────
+            hookproc           = _HOOKPROCTYPE(self._keyboard_hook)
             self._hookproc_ref = hookproc
 
             self._hook = _user32.SetWindowsHookExW(
                 WH_KEYBOARD_LL, hookproc, None, 0
             )
+            hook_err = ctypes.GetLastError()
             if not self._hook:
                 log.warning(
-                    "RawInputBridge: SetWindowsHookExW failed (%d) – workshop keystroke suppression disabled",
-                    ctypes.GetLastError(),
+                    "RawInputBridge: SetWindowsHookExW failed (error %d) – "
+                    "workshop keystroke suppression disabled",
+                    hook_err,
                 )
             else:
-                log.info("RawInputBridge: low-level keyboard hook installed")
+                log.info("RawInputBridge: WH_KEYBOARD_LL hook installed (hook=0x%X)", self._hook)
 
-            log.info("RawInputBridge: listener running (hwnd=%d)", hwnd)
+            log.info("RawInputBridge: listener running (hwnd=0x%X)", hwnd)
             if self._status_cb:
                 self._status_cb("bridge_status", "Listening")
 
             # ── message pump ────────────────────────────────────────────────────
+            # Runs on this dedicated thread; does NOT block tkinter's mainloop.
             msg = MSG()
             while self._running:
                 r = _user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
@@ -707,19 +876,26 @@ class RawInputBridge:
             if self._hook:
                 _user32.UnhookWindowsHookEx(self._hook)
                 self._hook = None
+                log.info("RawInputBridge: keyboard hook removed")
             if self._hwnd:
                 _user32.DestroyWindow(self._hwnd)
                 self._hwnd = None
+                log.info("RawInputBridge: message window destroyed")
 
-            log.info("RawInputBridge: stopped")
+            log.info("RawInputBridge: stopped cleanly")
             if self._status_cb:
                 self._status_cb("bridge_status", "Stopped")
 
         except Exception as exc:
-            import traceback
-            log.error("RawInputBridge: fatal exception in message loop:\n%s", traceback.format_exc())
+            tb = _tb.format_exc()
+            log.error("RawInputBridge: fatal exception in message loop:\n%s", tb)
+            try:
+                with open(str(_LOG_DIR / "scanner_bridge.log"), "a", encoding="utf-8") as _f:
+                    _f.write(f"[TRACEBACK]\n{tb}\n")
+            except Exception:
+                pass
             if self._status_cb:
-                self._status_cb("bridge_status", f"Error: {exc}")
+                self._status_cb("bridge_status", "Fallback keyboard mode")
 
     # ── WndProc ───────────────────────────────────────────────────────────────
 
@@ -975,7 +1151,10 @@ class StatusWindow:
         if self.root:
             self.root.after(0, self._refresh)
 
-    def run(self) -> None:
+    def run(self, on_ready: Optional[Callable[[], None]] = None) -> None:
+        """Start the tkinter mainloop.  If *on_ready* is provided it is called
+        200 ms after the window is displayed — use this to start the Raw Input
+        bridge *after* the UI is fully initialised (task requirement #8)."""
         self.root = tk.Tk()
         self.root.title("Scanner Bridge")
         self.root.resizable(False, False)
@@ -987,6 +1166,12 @@ class StatusWindow:
 
         self._build_ui()
         self._refresh()
+
+        if on_ready:
+            # Delay bridge start until after tkinter has processed its first
+            # events.  200 ms is enough for the window to become visible.
+            self.root.after(200, on_ready)
+
         self.root.mainloop()
 
     def _build_ui(self) -> None:
@@ -1253,12 +1438,15 @@ def main() -> None:
         # API reachability check (background, non-blocking)
         _check_api_connectivity(cfg.get("api_url", _DEFAULT_CFG["api_url"]))
 
-        log.info("Starting raw input listener thread...")
-        bridge.start()
-        log.info("Raw input listener thread started")
-
         if not devices:
             status_cb("bridge_status", "No scanners detected")
+
+        # The Raw Input bridge starts AFTER tkinter is shown (requirement #8).
+        # on_ready is called via root.after(200, …) so it never blocks the mainloop.
+        def _start_bridge() -> None:
+            log.info("Starting raw input listener thread (post-UI init)...")
+            bridge.start()
+            log.info("Raw input listener thread started")
 
         if first_run:
             # Defer the setup dialog until the main window is ready
@@ -1270,9 +1458,10 @@ def main() -> None:
             sw.root.protocol("WM_DELETE_WINDOW", sw._quit)
             sw.root.attributes("-topmost", True)
             sw.root.after(1500, lambda: sw.root.attributes("-topmost", False))
+            sw.root.after(200, _start_bridge)
             sw.root.mainloop()
         else:
-            sw.run()
+            sw.run(on_ready=_start_bridge)
 
         bridge.stop()
         bridge.wait()
