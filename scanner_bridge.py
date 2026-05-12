@@ -564,7 +564,7 @@ class ScannerBuffer:
         self._shifted: Dict[int, bool]     = defaultdict(bool)
 
     def key_down(self, handle: int, vkey: int, scan_code: int = 0) -> Optional[str]:
-        log.debug(
+        log.info(
             "RAW_KEY_EVENT device=0x%X vkey=0x%02X scan=0x%02X shift=%s",
             handle, vkey, scan_code, self._shifted[handle],
         )
@@ -599,7 +599,7 @@ class ScannerBuffer:
 
         if ch:
             self._chars[handle].append(ch)
-            log.debug(
+            log.info(
                 "APPENDED_CHAR device=0x%X vkey=0x%02X scan=0x%02X char=%r buffer=%r",
                 handle, vkey, scan_code, ch, "".join(self._chars[handle]),
             )
@@ -683,11 +683,10 @@ class RawInputBridge:
     Spawns a background thread that:
       1. Creates a hidden message-only Win32 window registered for WM_INPUT
          (RIDEV_INPUTSINK – receives input even when app is not focused).
-      2. Installs a WH_KEYBOARD_LL hook to suppress workshop-scanner keystrokes
-         before they reach the focused window.
-      3. Routes each keystroke:
-           sales role     → pass through unchanged
-           workshop role  → buffer until Enter, then POST; keystroke suppressed
+      2. Routes each WM_INPUT keystroke:
+           sales role     → pass through unchanged (no suppression)
+           workshop role  → buffer until Enter, then POST exact barcode to API
+    No WH_KEYBOARD_LL hook; no keystroke suppression of any kind.
     """
 
     _WND_CLASS = "ScannerBridgeWndClass"
@@ -711,34 +710,12 @@ class RawInputBridge:
             status_cb=status_cb,
         )
 
-        # Suppress workshop-scanner keystrokes from reaching the focused POS window.
-        #
-        # Two complementary mechanisms are combined so that the hook reliably
-        # suppresses every digit regardless of whether WM_INPUT or the LL hook
-        # fires first for a given keystroke:
-        #
-        # 1. _suppress_counts[vkey] — incremented by WM_INPUT for each workshop
-        #    key-down; decremented (and the keystroke suppressed) when the hook
-        #    fires for that vkey.  Handles repeated digits correctly: each digit
-        #    occurrence gets its own counter slot increment rather than a single
-        #    timestamp that would be overwritten.
-        #
-        # 2. _workshop_active_until — set to monotonic() + 300 ms by the first
-        #    WM_INPUT of a scan and refreshed by every subsequent key.  This
-        #    catches any key whose hook fires *before* the matching WM_INPUT is
-        #    dispatched (a known timing race on Windows).
-        self._suppress_counts:       Dict[int, int] = defaultdict(int)
-        self._workshop_active_until: float           = 0.0
-        self._suppress_lock          = threading.Lock()
-
         self._hwnd:     Optional[int] = None
-        self._hook:     Optional[int] = None
         self._thread:   Optional[threading.Thread] = None
         self._running   = False
 
-        # Keep callable refs alive so the GC doesn't free them
-        self._wndproc_ref:  Optional[object] = None
-        self._hookproc_ref: Optional[object] = None
+        # Keep callable ref alive so the GC doesn't free it
+        self._wndproc_ref: Optional[object] = None
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -928,23 +905,6 @@ class RawInputBridge:
 
             log.info("RawInputBridge: WM_INPUT registration successful (RIDEV_INPUTSINK)")
 
-            # ── install WH_KEYBOARD_LL hook (workshop keystroke suppression) ─────
-            hookproc           = _HOOKPROCTYPE(self._keyboard_hook)
-            self._hookproc_ref = hookproc
-
-            self._hook = _user32.SetWindowsHookExW(
-                WH_KEYBOARD_LL, hookproc, None, 0
-            )
-            hook_err = ctypes.GetLastError()
-            if not self._hook:
-                log.warning(
-                    "RawInputBridge: SetWindowsHookExW failed (error %d) – "
-                    "workshop keystroke suppression disabled",
-                    hook_err,
-                )
-            else:
-                log.info("RawInputBridge: WH_KEYBOARD_LL hook installed (hook=0x%X)", self._hook)
-
             log.info("RawInputBridge: listener running (hwnd=0x%X)", hwnd)
             if self._status_cb:
                 self._status_cb("bridge_status", "Listening")
@@ -960,10 +920,6 @@ class RawInputBridge:
                 _user32.DispatchMessageW(ctypes.byref(msg))
 
             # ── cleanup ──────────────────────────────────────────────────────────
-            if self._hook:
-                _user32.UnhookWindowsHookEx(self._hook)
-                self._hook = None
-                log.info("RawInputBridge: keyboard hook removed")
             if self._hwnd:
                 _user32.DestroyWindow(self._hwnd)
                 self._hwnd = None
@@ -1028,7 +984,7 @@ class RawInputBridge:
 
         role = self._role_for_handle(handle)
 
-        log.debug(
+        log.info(
             "RAW_KEY_EVENT handle=0x%X vkey=0x%02X scan=0x%02X flags=0x%02X "
             "is_down=%s role=%s",
             handle, vkey, scan_code, flags, is_down, role or "unmapped",
@@ -1039,54 +995,17 @@ class RawInputBridge:
 
         if role == "workshop":
             if is_down:
-                # Arm / refresh both suppression mechanisms BEFORE buffering so
-                # that the LL hook (which may already be queued) can see them.
-                with self._suppress_lock:
-                    self._suppress_counts[vkey] += 1
-                    self._workshop_active_until = time.monotonic() + 0.30  # 300 ms rolling
-
                 barcode = self._buffer.key_down(handle, vkey, scan_code)
                 if barcode:
                     log.info(
                         "FINAL_BARCODE device=0x%X barcode=%r len=%d",
                         handle, barcode, len(barcode),
                     )
-                    # Scan complete – clear suppression state immediately.
-                    with self._suppress_lock:
-                        self._suppress_counts.clear()
-                        self._workshop_active_until = 0.0
                     self._workshop.handle_scan(barcode)
             else:
-                # Key-up: release shift tracking only; do not touch suppress state.
                 self._buffer.key_up(handle, vkey)
 
-        # sales role: nothing extra to do – keystrokes pass through normally
-
-    # ── Keyboard hook (runs in the same message loop thread) ─────────────────
-
-    def _keyboard_hook(self, n_code: int, wparam: int, lparam: int) -> int:
-        if n_code == HC_ACTION and wparam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-            kb   = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-            vkey = kb.vkCode
-
-            with self._suppress_lock:
-                count  = self._suppress_counts.get(vkey, 0)
-                active = time.monotonic() < self._workshop_active_until
-
-            if count > 0 or active:
-                # Consume one count slot for this vkey (if available).
-                if count > 0:
-                    with self._suppress_lock:
-                        if self._suppress_counts[vkey] > 0:
-                            self._suppress_counts[vkey] -= 1
-
-                log.debug(
-                    "HOOK_SUPPRESS vkey=0x%02X count=%d active_window=%s",
-                    vkey, count, active,
-                )
-                return 1        # suppress: do NOT call CallNextHookEx
-
-        return _user32.CallNextHookEx(self._hook or 0, n_code, wparam, lparam)
+        # sales role: keystrokes pass through normally
 
 
 # ──────────────────────────────────────────────────────────────────────────────
